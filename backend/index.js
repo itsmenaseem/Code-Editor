@@ -11,19 +11,17 @@ import defaultCodes from "./codes/defaultcode.js";
 
 const app = express();
 const server = createServer(app);
-
 const io = new Server(server, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST'],
-  },
+  cors: { origin: '*', methods: ['GET', 'POST'] },
 });
 
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-const containers = {}; // { socketId: { containerId, ext } }
+const containers = {}; // { roomId: { containerId, ext, defaultCode } }
+const rooms = {};      // { roomId: [socketId, ...] }
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const Dir = path.join(__dirname, 'codes');
@@ -57,23 +55,17 @@ const startContainer = (id, language) => {
   try {
     const containerId = execSync(`docker run -dit \
       --cpus=".2" \
-      --memory=256m \
+      --memory=100m \
       --pids-limit=50 \
       --network none \
       --read-only \
       -v ${codeDir}:/codes \
-      ${image}
-    `).toString().trim();
+      ${image}`).toString().trim();
 
-    if(!containerId){
-        console.log("not created");
-        
-        return null;
-    }
     console.log(`🧱 Started container: ${containerId}`);
     return { containerId, ext, defaultCode };
   } catch (err) {
-    console.error('❌ Failed to start Docker container:', err.message);
+    console.error('❌ Docker error:', err.message);
     return null;
   }
 };
@@ -82,35 +74,34 @@ const stopContainer = (containerId) => {
   try {
     execSync(`docker stop ${containerId}`);
     execSync(`docker rm ${containerId}`);
-    console.log(`🧹 Stopped and removed container: ${containerId}`);
+    console.log(`🧹 Removed container: ${containerId}`);
   } catch (err) {
-    console.error(`❌ Error stopping container: ${err.message}`);
+    console.error('❌ Failed to stop container:', err.message);
   }
 };
 
 io.on('connection', (socket) => {
-  console.log(`⚡ User connected: ${socket.id}`);
+  let roomId;
   let shell = null;
 
-  socket.on("language-change", (language) => {
-    if (containers[socket.id]) {
-      if (shell) {
-        shell.kill();
-        shell = null;
-      }
-      const codeDir = path.join(Dir, `${socket.id}`);
-      fs.rmSync(codeDir, { recursive: true, force: true });
-      stopContainer(containers[socket.id].containerId);
-      delete containers[socket.id];
+  console.log(`⚡ Connected: ${socket.id}`);
+
+  socket.on("language-change", (language, id) => {
+    roomId = id;
+
+    if (!rooms[roomId]) {
+      rooms[roomId] = [];
+      const container = startContainer(roomId, language);
+      if (!container) return;
+      containers[roomId] = container;
+      socket.emit('default-code', container.defaultCode);
     }
 
-    const container = startContainer(socket.id, language);
-    if (!container) return;
+    if (!rooms[roomId].includes(socket.id)) {
+      rooms[roomId].push(socket.id);
+    }
 
-    const { containerId, ext, defaultCode } = container;
-    containers[socket.id] = { containerId, ext };
-
-    socket.emit('default-code', defaultCode);
+    const { containerId, ext, defaultCode } = containers[roomId];
 
     shell = pty.spawn('docker', [
       'exec', '-it', containerId,
@@ -127,14 +118,18 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('run-command', (cmd) => {
-    const {ext} = containers[socket.id]
-    if(ext ==='py'){ 
-        cmd = 'timeout 10s python main.py'
-    }
-    else if(ext === 'java'){
-        cmd = 'timeout 10s java main.java'
-    }
+  socket.on('run-command', (cmd, code) => {
+    const containerInfo = containers[roomId];
+    if (!containerInfo || !code) return;
+
+    const { ext, containerId } = containerInfo;
+    const codeDir = path.join(Dir, `${roomId}`);
+    const filePath = path.join(codeDir, `main.${ext}`);
+    fs.writeFileSync(filePath, code);
+
+    if (ext === 'py') cmd = 'python main.py';
+    else if (ext === 'java') cmd = 'javac main.java && java main';
+
     if (shell) shell.write(`${cmd}\r`);
   });
 
@@ -146,27 +141,24 @@ io.on('connection', (socket) => {
     if (shell) shell.resize(cols, rows);
   });
 
-  socket.on("code-change", (code) => {
-    const containerInfo = containers[socket.id];
-    if (!containerInfo) return;
-    const { ext } = containerInfo;
-    const codeDir = path.join(Dir, `${socket.id}`);
-    const filePath = path.join(codeDir, `main.${ext}`);
-    fs.writeFileSync(filePath, code);
-  });
-
   socket.on('disconnect', () => {
-    console.log(`❌ User disconnected: ${socket.id}`);
-    if (containers[socket.id]) {
+    console.log(`❌ Disconnected: ${socket.id}`);
+    if (!roomId || !rooms[roomId]) return;
+
+    const index = rooms[roomId].indexOf(socket.id);
+    if (index !== -1) rooms[roomId].splice(index, 1);
+
+    if (rooms[roomId].length === 0) {
       if (shell) shell.kill();
-      const codeDir = path.join(Dir, `${socket.id}`);
+      const codeDir = path.join(Dir, `${roomId}`);
       fs.rmSync(codeDir, { recursive: true, force: true });
-      stopContainer(containers[socket.id].containerId);
-      delete containers[socket.id];
+      stopContainer(containers[roomId].containerId);
+      delete containers[roomId];
+      delete rooms[roomId];
     }
   });
 });
 
 server.listen(4000, () => {
-  console.log('🚀 Server running at http://localhost:4000');
+  console.log('🚀 Server at http://localhost:4000');
 });
