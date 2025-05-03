@@ -8,7 +8,10 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from 'url';
 import defaultCodes from "./codes/defaultcode.js";
+/*
+npx y-websocket --port 1234
 
+*/
 const app = express();
 const server = createServer(app);
 const io = new Server(server, {
